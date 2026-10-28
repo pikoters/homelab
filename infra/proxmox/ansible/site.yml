@@ -1,0 +1,1120 @@
+---
+- name: Prepare Kubernetes nodes
+  hosts: controllers:workers
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Ensure swap is disabled for this boot
+      ansible.builtin.command: swapoff -a
+      changed_when: false
+
+    - name: Disable swap in fstab
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        regexp: '^\s*([^#]\S+)\s+\S+\s+swap\s+'
+        state: absent
+
+    - name: Load Kubernetes networking modules at boot
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+        mode: "0644"
+
+    - name: Load overlay module
+      ansible.builtin.command: modprobe overlay
+      changed_when: false
+
+    - name: Load bridge netfilter module
+      ansible.builtin.command: modprobe br_netfilter
+      changed_when: false
+
+    - name: Configure Kubernetes networking sysctls
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-kubernetes-cri.conf
+        content: |
+          net.bridge.bridge-nf-call-iptables = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward = 1
+        mode: "0644"
+
+    - name: Apply Kubernetes networking sysctls
+      ansible.builtin.command: sysctl --system
+      changed_when: false
+
+    - name: Install containerd and Kubernetes repository prerequisites
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - containerd
+          - curl
+          - gpg
+          - python3-debian
+        state: present
+        update_cache: true
+
+    - name: Install NFS client tools when persistent storage is enabled
+      ansible.builtin.apt:
+        name: nfs-common
+        state: present
+        update_cache: true
+      when: enable_nfs_storage
+
+    - name: Create apt keyrings directory
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Download Kubernetes package signing key
+      ansible.builtin.get_url:
+        url: "https://pkgs.k8s.io/core:/stable:/{{ kubernetes_minor_version }}/deb/Release.key"
+        dest: /tmp/kubernetes-release.key
+        mode: "0644"
+
+    - name: Install Kubernetes package signing key
+      ansible.builtin.command:
+        cmd: gpg --dearmor --yes --output /etc/apt/keyrings/kubernetes-apt-keyring.gpg /tmp/kubernetes-release.key
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Configure Kubernetes apt repository
+      ansible.builtin.deb822_repository:
+        name: kubernetes
+        types: [deb]
+        uris: "https://pkgs.k8s.io/core:/stable:/{{ kubernetes_minor_version }}/deb/"
+        suites: [/]
+        signed_by: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        state: present
+
+    - name: Install kubelet, kubeadm, and kubectl
+      ansible.builtin.apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+        update_cache: true
+
+    - name: Generate default containerd configuration
+      ansible.builtin.command: containerd config default
+      register: containerd_default_config
+      changed_when: false
+
+    - name: Ensure containerd configuration directory exists
+      ansible.builtin.file:
+        path: /etc/containerd
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Configure containerd to use systemd cgroups
+      ansible.builtin.copy:
+        dest: /etc/containerd/config.toml
+        content: "{{ containerd_default_config.stdout | regex_replace('SystemdCgroup = false', 'SystemdCgroup = true') }}"
+        mode: "0644"
+      notify: Restart containerd
+
+    - name: Enable and start containerd
+      ansible.builtin.service:
+        name: containerd
+        state: started
+        enabled: true
+
+    - name: Enable and start kubelet
+      ansible.builtin.service:
+        name: kubelet
+        state: started
+        enabled: true
+
+  handlers:
+    - name: Restart containerd
+      ansible.builtin.service:
+        name: containerd
+        state: restarted
+
+- name: Bootstrap the primary control plane
+  hosts: controllers_primary
+  become: true
+  gather_facts: true
+  vars:
+    kubernetes_api_endpoint: "{{ kube_vip_address if enable_kube_vip else hostvars[inventory_hostname].ansible_host }}"
+    controller_node_address: "{{ hostvars[inventory_hostname].ansible_host }}"
+  tasks:
+    - name: Validate HA and networking configuration
+      ansible.builtin.assert:
+        that:
+          - >-
+            not enable_kube_vip or
+            (
+              kube_vip_address | length > 0 and
+              kube_vip_address not in
+              (groups['controllers'] | map('extract', hostvars, 'ansible_host') | list) and
+              kube_vip_interface in ansible_interfaces
+            )
+        fail_msg: >-
+          To enable kube-vip, configure a dedicated unused VIP and a network
+          interface present on the primary controller; the VIP must not equal
+          any node IP.
+
+    - name: Explain that additional controllers are unused while HA is disabled
+      ansible.builtin.debug:
+        msg: >-
+          kube-vip is disabled. Only {{ groups['controllers_primary'][0] }} will
+          join the Kubernetes cluster; configured additional controllers will
+          remain unjoined until HA is deliberately enabled.
+      when:
+        - not enable_kube_vip
+        - groups['controllers_additional'] | length > 0
+
+    - name: Ensure Kubernetes manifests directory exists for kube-vip bootstrap
+      ansible.builtin.file:
+        path: /etc/kubernetes/manifests
+        state: directory
+        mode: "0755"
+      when: enable_kube_vip
+
+    - name: Install kube-vip static pod manifest for bootstrap
+      ansible.builtin.template:
+        src: templates/kube-vip.yaml.j2
+        dest: /etc/kubernetes/manifests/kube-vip.yaml
+        mode: "0600"
+      vars:
+        kube_vip_kubeconfig: /etc/kubernetes/super-admin.conf
+      when: enable_kube_vip
+
+    - name: Remove stale kube-vip static pod when HA is disabled
+      ansible.builtin.file:
+        path: /etc/kubernetes/manifests/kube-vip.yaml
+        state: absent
+      when: not enable_kube_vip
+
+    - name: Initialize the control plane
+      ansible.builtin.command:
+        cmd: >-
+          kubeadm init
+          --control-plane-endpoint={{ kubernetes_api_endpoint }}:6443
+          --apiserver-advertise-address={{ controller_node_address }}
+          --pod-network-cidr={{ pod_network_cidr }}
+          --node-name={{ inventory_hostname }}
+        creates: /etc/kubernetes/admin.conf
+
+    - name: Read the current Kubernetes API endpoint from admin kubeconfig
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - config
+          - view
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - --minify
+          - -o
+          - jsonpath={.clusters[0].cluster.server}
+      register: current_admin_api_endpoint
+      changed_when: false
+
+    - name: Point admin kubeconfig at the selected Kubernetes API endpoint
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - config
+          - set-cluster
+          - kubernetes
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - --server=https://{{ kubernetes_api_endpoint }}:6443
+      when: current_admin_api_endpoint.stdout != "https://" ~ kubernetes_api_endpoint ~ ":6443"
+
+    - name: Configure kube-vip to use the normal admin kubeconfig
+      ansible.builtin.template:
+        src: templates/kube-vip.yaml.j2
+        dest: /etc/kubernetes/manifests/kube-vip.yaml
+        mode: "0600"
+      vars:
+        kube_vip_kubeconfig: /etc/kubernetes/admin.conf
+      when: enable_kube_vip
+
+    - name: Wait for the API server on the primary controller address
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - --server=https://{{ kubernetes_api_endpoint }}:6443
+          - get
+          - --raw=/readyz
+      register: local_api_ready
+      retries: 30
+      delay: 5
+      until: local_api_ready.stdout | trim == "ok"
+      changed_when: false
+
+    - name: Check the kube-vip API endpoint
+      block:
+        - name: Wait for kube-vip to serve the Kubernetes API
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - --kubeconfig=/etc/kubernetes/admin.conf
+              - --server=https://{{ kubernetes_api_endpoint }}:6443
+              - get
+              - --raw=/readyz
+          register: vip_api_ready
+          retries: 30
+          delay: 5
+          until: vip_api_ready.stdout | trim == "ok"
+          changed_when: false
+
+      rescue:
+        - name: Inspect the kube-vip network interface
+          ansible.builtin.command:
+            argv:
+              - ip
+              - -brief
+              - address
+              - show
+              - dev
+              - "{{ kube_vip_interface }}"
+          register: kube_vip_interface_status
+          changed_when: false
+          failed_when: false
+
+        - name: Display kube-vip interface status
+          ansible.builtin.debug:
+            var: kube_vip_interface_status.stdout
+
+        - name: Inspect the controller's address for the kube-vip endpoint
+          ansible.builtin.command:
+            argv:
+              - ip
+              - -brief
+              - -4
+              - address
+              - show
+              - dev
+              - "{{ kube_vip_interface }}"
+          register: kube_vip_address_status
+          changed_when: false
+          failed_when: false
+
+        - name: Display controller and kube-vip addresses
+          ansible.builtin.debug:
+            var: kube_vip_address_status.stdout
+
+        - name: Inspect the controller's neighbor entry for kube-vip
+          ansible.builtin.command:
+            argv:
+              - ip
+              - neighbor
+              - show
+              - "{{ kube_vip_address }}"
+              - dev
+              - "{{ kube_vip_interface }}"
+          register: kube_vip_neighbor_status
+          changed_when: false
+          failed_when: false
+
+        - name: Display kube-vip neighbor entry
+          ansible.builtin.debug:
+            var: kube_vip_neighbor_status.stdout
+
+        - name: Inspect Kubernetes static pod containers
+          ansible.builtin.command:
+            argv:
+              - crictl
+              - ps
+              - -a
+              - --name
+              - kube-vip
+              - -q
+          register: static_pod_containers
+          changed_when: false
+          failed_when: false
+
+        - name: Display Kubernetes static pod containers
+          ansible.builtin.debug:
+            var: static_pod_containers.stdout
+
+        - name: Read kube-vip container logs
+          ansible.builtin.command:
+            argv:
+              - crictl
+              - logs
+              - "{{ item }}"
+          loop: "{{ static_pod_containers.stdout_lines }}"
+          register: kube_vip_container_logs
+          changed_when: false
+          failed_when: false
+
+        - name: Display kube-vip container logs
+          ansible.builtin.debug:
+            msg: "{{ item.stdout | default(item.stderr) }}"
+          loop: "{{ kube_vip_container_logs.results | default([]) }}"
+
+        - name: Inspect system pods through the controller address
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - --kubeconfig=/etc/kubernetes/admin.conf
+              - --server=https://{{ kubernetes_api_endpoint }}:6443
+              - get
+              - pods
+              - --namespace=kube-system
+              - --output=wide
+          register: system_pods
+          changed_when: false
+          failed_when: false
+
+        - name: Display system pod status
+          ansible.builtin.debug:
+            var: system_pods.stdout
+
+        - name: Stop because the Kubernetes API VIP is unavailable
+          ansible.builtin.fail:
+            msg: >-
+              The API server was not reachable through the kube-vip endpoint
+              {{ kube_vip_address }}:6443. Check the kube-vip pod status and
+              logs, interface {{ kube_vip_interface }}, and Layer 2 network
+              configuration before continuing.
+      when: enable_kube_vip
+
+    - name: Install Flannel pod networking
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - --server=https://{{ kubernetes_api_endpoint }}:6443
+          - apply
+          - -f
+          - "{{ flannel_manifest_url }}"
+      register: flannel_apply
+      changed_when: "'created' in flannel_apply.stdout or 'configured' in flannel_apply.stdout"
+
+    - name: Upload control-plane certificates for additional controllers
+      ansible.builtin.command: kubeadm init phase upload-certs --upload-certs
+      register: kubeadm_uploaded_certs
+      changed_when: false
+      no_log: true
+      when: enable_kube_vip
+
+    - name: Save the control-plane certificate key
+      ansible.builtin.set_fact:
+        kubeadm_certificate_key: "{{ kubeadm_uploaded_certs.stdout | regex_search('[0-9a-f]{64}') }}"
+      no_log: true
+      when: enable_kube_vip
+
+    - name: Verify kubeadm generated a control-plane certificate key
+      ansible.builtin.assert:
+        that:
+          - kubeadm_certificate_key is match('^[0-9a-f]{64}$')
+        fail_msg: "kubeadm did not return a valid control-plane certificate key."
+      when: enable_kube_vip
+
+    - name: Read kubeadm cluster configuration
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - --server=https://{{ kubernetes_api_endpoint }}:6443
+          - get
+          - configmap
+          - kubeadm-config
+          - --namespace=kube-system
+          - --output=json
+      register: kubeadm_configmap
+      changed_when: false
+
+    - name: Parse kubeadm cluster configuration
+      ansible.builtin.set_fact:
+        current_kubeadm_cluster_configuration: >-
+          {{ (kubeadm_configmap.stdout | from_json).data.ClusterConfiguration | from_yaml }}
+
+    - name: Update kubeadm cluster API endpoint when kube-vip is disabled
+      when:
+        - not enable_kube_vip
+        - >-
+          (current_kubeadm_cluster_configuration.controlPlaneEndpoint | default(''))
+          != kubernetes_api_endpoint ~ ':6443'
+      block:
+        - name: Patch the kubeadm-config ConfigMap to use the controller IP
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - --kubeconfig=/etc/kubernetes/admin.conf
+              - --server=https://{{ kubernetes_api_endpoint }}:6443
+              - patch
+              - configmap
+              - kubeadm-config
+              - --namespace=kube-system
+              - --type=merge
+              - --patch
+              - >-
+                {{
+                  {
+                    'data': {
+                      'ClusterConfiguration':
+                        current_kubeadm_cluster_configuration
+                        | combine({'controlPlaneEndpoint': kubernetes_api_endpoint ~ ':6443'})
+                        | to_nice_yaml(indent=2)
+                    }
+                  } | to_json
+                }}
+          changed_when: true
+
+    - name: Read kubeadm cluster configuration after endpoint update
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - --server=https://{{ kubernetes_api_endpoint }}:6443
+          - get
+          - configmap
+          - kubeadm-config
+          - --namespace=kube-system
+          - --output=json
+      register: verified_kubeadm_configmap
+      changed_when: false
+
+    - name: Verify kubeadm cluster configuration uses the selected API endpoint
+      ansible.builtin.assert:
+        that:
+          - >-
+            (
+              (verified_kubeadm_configmap.stdout | from_json)
+              .data.ClusterConfiguration | from_yaml
+            ).controlPlaneEndpoint == kubernetes_api_endpoint ~ ':6443'
+        fail_msg: >-
+          kubeadm-config still does not use the selected API endpoint
+          {{ kubernetes_api_endpoint }}:6443. Workers will not be joined until
+          the control-plane endpoint is corrected.
+
+    - name: Read kubeadm public cluster discovery configuration
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - --server=https://{{ kubernetes_api_endpoint }}:6443
+          - get
+          - configmap
+          - cluster-info
+          - --namespace=kube-public
+          - --output=json
+      register: kubeadm_cluster_info
+      changed_when: false
+
+    - name: Parse kubeadm public cluster discovery kubeconfig
+      ansible.builtin.set_fact:
+        current_cluster_info_kubeconfig: >-
+          {{ (kubeadm_cluster_info.stdout | from_json).data.kubeconfig | from_yaml }}
+
+    - name: Require the standard single-cluster discovery kubeconfig
+      ansible.builtin.assert:
+        that:
+          - current_cluster_info_kubeconfig.clusters | length == 1
+        fail_msg: >-
+          kube-public/cluster-info does not contain exactly one cluster;
+          refusing to rewrite its discovery endpoint automatically.
+
+    - name: Update kubeadm bootstrap discovery endpoint
+      when: >-
+        current_cluster_info_kubeconfig.clusters[0].cluster.server
+        != 'https://' ~ kubernetes_api_endpoint ~ ':6443'
+      block:
+        - name: Build cluster discovery kubeconfig using selected API endpoint
+          ansible.builtin.set_fact:
+            updated_cluster_info_kubeconfig: >-
+              {{
+                current_cluster_info_kubeconfig
+                | combine({
+                    'clusters': [
+                      current_cluster_info_kubeconfig.clusters[0]
+                      | combine({
+                          'cluster':
+                            current_cluster_info_kubeconfig.clusters[0].cluster
+                            | combine({
+                                'server':
+                                  'https://' ~ kubernetes_api_endpoint ~ ':6443'
+                              })
+                        })
+                    ]
+                  })
+              }}
+
+        - name: Patch kubeadm public cluster discovery ConfigMap
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - --kubeconfig=/etc/kubernetes/admin.conf
+              - --server=https://{{ kubernetes_api_endpoint }}:6443
+              - patch
+              - configmap
+              - cluster-info
+              - --namespace=kube-public
+              - --type=merge
+              - --patch
+              - >-
+                {{
+                  {
+                    'data': {
+                      'kubeconfig':
+                        updated_cluster_info_kubeconfig | to_nice_yaml(indent=2)
+                    }
+                  } | to_json
+                }}
+          changed_when: true
+
+    - name: Verify kubeadm bootstrap discovery endpoint
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - --server=https://{{ kubernetes_api_endpoint }}:6443
+          - get
+          - configmap
+          - cluster-info
+          - --namespace=kube-public
+          - --output=jsonpath={.data.kubeconfig}
+      register: verified_cluster_info_kubeconfig
+      changed_when: false
+
+    - name: Assert bootstrap discovery uses the selected API endpoint
+      ansible.builtin.assert:
+        that:
+          - >-
+            (
+              verified_cluster_info_kubeconfig.stdout | from_yaml
+            ).clusters[0].cluster.server
+            == 'https://' ~ kubernetes_api_endpoint ~ ':6443'
+        fail_msg: >-
+          kube-public/cluster-info still points at a different API endpoint.
+          Workers will not be joined.
+
+    - name: Create a short-lived kubeadm bootstrap token
+      ansible.builtin.command: kubeadm token create
+      register: kubeadm_bootstrap_token
+      changed_when: false
+      no_log: true
+
+    - name: Calculate the Kubernetes CA public key hash
+      ansible.builtin.shell:
+        cmd: >-
+          openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt
+          | openssl pkey -pubin -outform DER
+          | openssl dgst -sha256
+          | awk '{print $NF}'
+      register: kubeadm_ca_hash
+      changed_when: false
+
+    - name: Assemble kubeadm worker join arguments
+      ansible.builtin.set_fact:
+        kubeadm_worker_join_argv: >-
+          {{
+            [
+              'kubeadm',
+              'join',
+              kubernetes_api_endpoint ~ ':6443',
+              '--token',
+              kubeadm_bootstrap_token.stdout | trim,
+              '--discovery-token-ca-cert-hash',
+              'sha256:' ~ (kubeadm_ca_hash.stdout | trim)
+            ]
+          }}
+      no_log: true
+
+    - name: Verify worker join command uses the selected API endpoint
+      ansible.builtin.assert:
+        that:
+          - kubeadm_worker_join_argv[0:2] == ['kubeadm', 'join']
+          - kubeadm_worker_join_argv[2] == kubernetes_api_endpoint ~ ':6443'
+          - kubeadm_ca_hash.stdout | trim is match('^[0-9a-f]{64}$')
+        fail_msg: "Generated kubeadm join arguments do not target the selected Kubernetes API endpoint."
+
+    - name: Display selected API endpoint for worker joins
+      ansible.builtin.debug:
+        msg: "Workers will join through {{ kubeadm_worker_join_argv[2] }}."
+
+    - name: Create kubeconfig directory for the SSH user
+      ansible.builtin.file:
+        path: "{{ ansible_user_dir }}/.kube"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0755"
+
+    - name: Copy admin kubeconfig for the SSH user
+      ansible.builtin.copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "{{ ansible_user_dir }}/.kube/config"
+        remote_src: true
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0600"
+
+- name: Join additional control-plane nodes
+  hosts: controllers_additional
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Join the control plane through kube-vip
+      ansible.builtin.command:
+        cmd: >-
+          {{ hostvars[groups['controllers_primary'][0]].kubeadm_join_command.stdout }}
+          --control-plane
+          --certificate-key={{ hostvars[groups['controllers_primary'][0]].kubeadm_certificate_key }}
+          --apiserver-advertise-address={{ ansible_default_ipv4.address }}
+          --node-name={{ inventory_hostname }}
+        creates: /etc/kubernetes/admin.conf
+      no_log: true
+      when: enable_kube_vip
+
+    - name: Install kube-vip static pod manifest
+      ansible.builtin.template:
+        src: templates/kube-vip.yaml.j2
+        dest: /etc/kubernetes/manifests/kube-vip.yaml
+        mode: "0600"
+      vars:
+        kube_vip_kubeconfig: /etc/kubernetes/admin.conf
+      when: enable_kube_vip
+
+    - name: Create kubeconfig directory for the SSH user
+      ansible.builtin.file:
+        path: "{{ ansible_user_dir }}/.kube"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0755"
+      when: enable_kube_vip
+
+    - name: Copy admin kubeconfig for the SSH user
+      ansible.builtin.copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "{{ ansible_user_dir }}/.kube/config"
+        remote_src: true
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0600"
+      when: enable_kube_vip
+
+- name: Join worker nodes
+  hosts: workers
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Join worker to the control plane
+      block:
+        - name: Run kubeadm join
+          ansible.builtin.command:
+            argv: "{{ hostvars[groups['controllers_primary'][0]].kubeadm_worker_join_argv }}"
+            creates: /etc/kubernetes/kubelet.conf
+          register: kubeadm_worker_join_result
+          no_log: true
+
+      rescue:
+        - name: Display redacted kubeadm join failure
+          ansible.builtin.fail:
+            msg: >-
+              kubeadm join failed on {{ inventory_hostname }} with return code
+              {{ kubeadm_worker_join_result.rc | default('unknown') }}.
+              stderr={{
+                (kubeadm_worker_join_result.stderr | default(''))
+                | regex_replace('[A-Za-z0-9]{6}\.[A-Za-z0-9]{16}', '[REDACTED_TOKEN]')
+                | regex_replace('[0-9a-fA-F]{64}', '[REDACTED_CERTIFICATE_KEY]')
+              }}
+              stdout={{
+                (kubeadm_worker_join_result.stdout | default(''))
+                | regex_replace('[A-Za-z0-9]{6}\.[A-Za-z0-9]{16}', '[REDACTED_TOKEN]')
+                | regex_replace('[0-9a-fA-F]{64}', '[REDACTED_CERTIFICATE_KEY]')
+              }}
+              If this node has partial kubeadm state, inspect it before retrying;
+              do not reset a node that has successfully joined.
+
+- name: Install ingress and persistent storage
+  hosts: controllers_primary
+  become: true
+  gather_facts: false
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  tasks:
+    - name: Validate NFS configuration when persistent storage is enabled
+      ansible.builtin.assert:
+        that:
+          - nfs_server | length > 0
+          - nfs_export_path | length > 0
+        fail_msg: >-
+          Set an accessible NFS server and export in ansible/group_vars/all.yml,
+          or set enable_nfs_storage: false.
+      when: enable_nfs_storage
+
+    - name: Validate MetalLB configuration when enabled
+      ansible.builtin.assert:
+        that:
+          - metallb_address_range | length > 0
+        fail_msg: "Set metallb_address_range to a reserved LAN IP range when enable_metallb is true."
+      when: enable_metallb
+
+    - name: Download Helm signing key
+      ansible.builtin.get_url:
+        url: "{{ helm_repository_key_url }}"
+        dest: /tmp/helm-signing.asc
+        mode: "0644"
+      register: helm_signing_key_download
+      retries: 5
+      delay: 10
+      until: not helm_signing_key_download.failed
+
+    - name: Extract Helm signing key fingerprint
+      ansible.builtin.shell:
+        cmd: >-
+          gpg --show-keys --with-colons --fingerprint /tmp/helm-signing.asc
+          | awk -F: '$1 == "fpr" { print toupper($10); exit }'
+      register: helm_signing_key_details
+      changed_when: false
+
+    - name: Verify Helm signing key fingerprint
+      ansible.builtin.assert:
+        that:
+          - helm_signing_key_details.stdout | trim == helm_repository_key_fingerprint | upper
+        fail_msg: >-
+          Helm repository signing key fingerprint does not match the expected
+          official fingerprint; refusing to trust the key.
+
+    - name: Install Helm signing key
+      ansible.builtin.command:
+        cmd: gpg --dearmor --yes --output /etc/apt/keyrings/helm-buildkite.gpg /tmp/helm-signing.asc
+        creates: /etc/apt/keyrings/helm-buildkite.gpg
+
+    - name: Remove the previous Helm apt repository if present
+      ansible.builtin.deb822_repository:
+        name: helm-stable-debian
+        state: absent
+
+    - name: Configure Helm apt repository
+      ansible.builtin.deb822_repository:
+        name: helm-buildkite
+        types: [deb]
+        uris: https://packages.buildkite.com/helm-linux/helm-debian/any
+        suites: [any]
+        components: [main]
+        signed_by: /etc/apt/keyrings/helm-buildkite.gpg
+        state: present
+
+    - name: Install Helm
+      ansible.builtin.apt:
+        name: helm
+        state: present
+        update_cache: true
+
+    - name: Add MetalLB Helm repository
+      ansible.builtin.command:
+        argv:
+          - helm
+          - repo
+          - add
+          - metallb
+          - https://metallb.github.io/metallb
+          - --force-update
+      changed_when: false
+      when: enable_metallb
+
+    - name: Add Traefik Helm repository
+      ansible.builtin.command:
+        argv:
+          - helm
+          - repo
+          - add
+          - traefik
+          - https://traefik.github.io/charts
+          - --force-update
+      changed_when: false
+
+    - name: Add NFS provisioner Helm repository
+      ansible.builtin.command:
+        argv:
+          - helm
+          - repo
+          - add
+          - nfs-subdir-external-provisioner
+          - https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner/
+          - --force-update
+      changed_when: false
+      when: enable_nfs_storage
+
+    - name: Update Traefik Helm repository
+      ansible.builtin.command:
+        argv:
+          - helm
+          - repo
+          - update
+          - traefik
+      changed_when: false
+
+    - name: Update MetalLB Helm repository when enabled
+      ansible.builtin.command:
+        argv:
+          - helm
+          - repo
+          - update
+          - metallb
+      changed_when: false
+      when: enable_metallb
+
+    - name: Update NFS provisioner Helm repository when enabled
+      ansible.builtin.command:
+        argv:
+          - helm
+          - repo
+          - update
+          - nfs-subdir-external-provisioner
+      changed_when: false
+      when: enable_nfs_storage
+
+    - name: Install MetalLB
+      ansible.builtin.command:
+        argv:
+          - helm
+          - upgrade
+          - --install
+          - metallb
+          - metallb/metallb
+          - --version
+          - "{{ metallb_chart_version }}"
+          - --namespace
+          - metallb-system
+          - --create-namespace
+          - --wait
+      register: metallb_install
+      changed_when: "'has been upgraded' in metallb_install.stdout or 'has been installed' in metallb_install.stdout"
+      when: enable_metallb
+
+    - name: Wait for MetalLB address-pool custom resources
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - wait
+          - --for=condition=Established
+          - --timeout=120s
+          - crd/ipaddresspools.metallb.io
+          - crd/l2advertisements.metallb.io
+      changed_when: false
+      when: enable_metallb
+
+    - name: Install MetalLB layer-2 address pool
+      ansible.builtin.template:
+        src: templates/metallb-pool.yaml.j2
+        dest: /tmp/metallb-pool.yaml
+        mode: "0600"
+      when: enable_metallb
+
+    - name: Apply MetalLB layer-2 address pool
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - apply
+          - -f
+          - /tmp/metallb-pool.yaml
+      register: metallb_config
+      changed_when: "'created' in metallb_config.stdout or 'configured' in metallb_config.stdout"
+      when: enable_metallb
+
+    - name: Install Traefik ingress controller
+      ansible.builtin.command:
+        argv:
+          - helm
+          - upgrade
+          - --install
+          - traefik
+          - traefik/traefik
+          - --version
+          - "{{ traefik_chart_version }}"
+          - --namespace
+          - traefik
+          - --create-namespace
+          - --set
+          - "service.type={{ 'LoadBalancer' if enable_metallb else 'NodePort' }}"
+          - --wait
+      register: traefik_install
+      changed_when: "'has been upgraded' in traefik_install.stdout or 'has been installed' in traefik_install.stdout"
+
+    - name: Install NFS dynamic storage provisioner
+      block:
+        - name: Run Helm install for NFS provisioner
+          ansible.builtin.command:
+            argv:
+              - helm
+              - upgrade
+              - --install
+              - nfs-subdir-external-provisioner
+              - nfs-subdir-external-provisioner/nfs-subdir-external-provisioner
+              - --version
+              - "{{ nfs_provisioner_chart_version }}"
+              - --namespace
+              - nfs-provisioner
+              - --create-namespace
+              - --set-string
+              - "nfs.server={{ nfs_server }}"
+              - --set-string
+              - "nfs.path={{ nfs_export_path }}"
+              - --set-string
+              - "storageClass.name={{ nfs_storage_class_name }}"
+              - --set
+              - "storageClass.defaultClass={{ nfs_storage_class_default | lower }}"
+              - --set
+              - "storageClass.reclaimPolicy={{ nfs_storage_reclaim_policy }}"
+              - --wait
+          register: nfs_install
+          changed_when: "'has been upgraded' in nfs_install.stdout or 'has been installed' in nfs_install.stdout"
+
+      rescue:
+        - name: Inspect NFS provisioner deployment
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - --kubeconfig=/etc/kubernetes/admin.conf
+              - get
+              - deployment
+              - nfs-subdir-external-provisioner
+              - --namespace=nfs-provisioner
+              - --output=wide
+          register: nfs_deployment_status
+          changed_when: false
+          failed_when: false
+
+        - name: Display NFS provisioner deployment status
+          ansible.builtin.debug:
+            var: nfs_deployment_status.stdout
+
+        - name: Inspect NFS provisioner pods
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - --kubeconfig=/etc/kubernetes/admin.conf
+              - get
+              - pods
+              - --namespace=nfs-provisioner
+              - --output=wide
+          register: nfs_pod_status
+          changed_when: false
+          failed_when: false
+
+        - name: Display NFS provisioner pod status
+          ansible.builtin.debug:
+            var: nfs_pod_status.stdout
+
+        - name: Inspect NFS provisioner events
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - --kubeconfig=/etc/kubernetes/admin.conf
+              - get
+              - events
+              - --namespace=nfs-provisioner
+              - --sort-by=.lastTimestamp
+          register: nfs_events
+          changed_when: false
+          failed_when: false
+
+        - name: Display NFS provisioner events
+          ansible.builtin.debug:
+            var: nfs_events.stdout
+
+        - name: Read NFS provisioner deployment logs
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - --kubeconfig=/etc/kubernetes/admin.conf
+              - logs
+              - deployment/nfs-subdir-external-provisioner
+              - --namespace=nfs-provisioner
+              - --all-containers=true
+              - --tail=100
+          register: nfs_provisioner_logs
+          changed_when: false
+          failed_when: false
+
+        - name: Display NFS provisioner logs
+          ansible.builtin.debug:
+            msg: "{{ nfs_provisioner_logs.stdout | default(nfs_provisioner_logs.stderr) }}"
+
+        - name: Fail with NFS provisioner deployment diagnostics
+          ansible.builtin.fail:
+            msg: >-
+              NFS persistent storage is enabled, but its provisioner did not
+              become ready. Check the pod events and logs above, plus NFS
+              server/export reachability and permissions. To skip NFS storage,
+              set enable_nfs_storage: false.
+      when: enable_nfs_storage
+
+    - name: Report that NFS-backed persistent storage is disabled
+      ansible.builtin.debug:
+        msg: >-
+          NFS-backed persistent storage is disabled. No NFS provisioner or
+          StorageClass was configured.
+      when: not enable_nfs_storage
+
+- name: Verify the cluster and provisioners
+  hosts: controllers_primary
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Wait for all cluster nodes to become Ready
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - wait
+          - --for=condition=Ready
+          - nodes
+          - --all
+          - --timeout=300s
+      changed_when: false
+
+    - name: Wait for the Traefik service to receive a MetalLB IP
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - get
+          - service
+          - traefik
+          - --namespace=traefik
+          - -o
+          - json
+      register: traefik_service
+      retries: 60
+      delay: 5
+      until: (traefik_service.stdout | from_json).status.loadBalancer.ingress is defined
+      changed_when: false
+      when: enable_metallb
+
+    - name: Read Traefik NodePort service when MetalLB is disabled
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - get
+          - service
+          - traefik
+          - --namespace=traefik
+          - --output=json
+      register: traefik_nodeport_service
+      changed_when: false
+      when: not enable_metallb
+
+    - name: Display Traefik NodePort access details
+      ansible.builtin.debug:
+        msg: >-
+          MetalLB is disabled. Access Traefik using a Kubernetes node IP and
+          these service ports:
+          {{ (traefik_nodeport_service.stdout | from_json).spec.ports | to_nice_json }}
+      when: not enable_metallb
+
+    - name: Wait for the NFS storage class to be registered
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - get
+          - storageclass
+          - "{{ nfs_storage_class_name }}"
+      changed_when: false
+      when: enable_nfs_storage

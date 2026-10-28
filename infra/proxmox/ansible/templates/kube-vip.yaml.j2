@@ -1,0 +1,58 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kube-vip
+  namespace: kube-system
+spec:
+  containers:
+    - name: kube-vip
+      image: ghcr.io/kube-vip/kube-vip:{{ kube_vip_version }}
+      imagePullPolicy: IfNotPresent
+      args:
+        - manager
+      env:
+        - name: vip_arp
+          value: "true"
+        - name: vip_interface
+          value: "{{ kube_vip_interface }}"
+        - name: vip_leaderelection
+          value: "true"
+        - name: vip_leaseduration
+          value: "5"
+        - name: vip_renewdeadline
+          value: "3"
+        - name: vip_retryperiod
+          value: "1"
+        - name: cp_enable
+          value: "true"
+        - name: cp_namespace
+          value: kube-system
+        - name: address
+          value: "{{ kube_vip_address }}"
+        - name: port
+          value: "6443"
+        - name: vip_subnet
+          value: "32"
+        - name: KUBECONFIG
+          value: "{{ kube_vip_kubeconfig }}"
+      securityContext:
+        capabilities:
+          add:
+            - NET_ADMIN
+            - NET_RAW
+            - SYS_TIME
+      volumeMounts:
+        - name: kubeconfig
+          mountPath: "{{ kube_vip_kubeconfig }}"
+          readOnly: true
+  hostNetwork: true
+  hostAliases:
+    - hostnames:
+        - kubernetes
+      ip: 127.0.0.1
+  volumes:
+    - name: kubeconfig
+      hostPath:
+        path: "{{ kube_vip_kubeconfig }}"
+        type: FileOrCreate
+  priorityClassName: system-node-critical

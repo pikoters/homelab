@@ -1,1 +1,5 @@
 .DS_Store
+
+infra/proxmox/**/.terraform/
+infra/proxmox/**/terraform.tfstate*
+infra/proxmox/**/terraform.tfvars

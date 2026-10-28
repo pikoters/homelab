@@ -1,0 +1,21 @@
+---
+kubernetes_minor_version: "v1.35"
+pod_network_cidr: "10.244.0.0/16"
+flannel_manifest_url: "https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml"
+enable_kube_vip: false
+kube_vip_address: ""
+kube_vip_interface: "{{ ansible_default_ipv4.interface }}"
+kube_vip_version: "v0.8.9"
+helm_repository_key_url: "https://packages.buildkite.com/helm-linux/helm-debian/gpgkey"
+helm_repository_key_fingerprint: "DDF78C3E6EBB2D2CC223C95C62BA89D07698DBC6"
+enable_metallb: false
+metallb_chart_version: "0.16.1"
+metallb_address_range: ""
+traefik_chart_version: "41.6.0"
+enable_nfs_storage: false
+nfs_provisioner_chart_version: "4.0.18"
+nfs_server: "192.168.40.10"
+nfs_export_path: "/zfs-single"
+nfs_storage_class_name: "nfs-client"
+nfs_storage_class_default: true
+nfs_storage_reclaim_policy: "Retain"

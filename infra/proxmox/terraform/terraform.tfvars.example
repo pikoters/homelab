@@ -1,0 +1,44 @@
+proxmox_api_url       = "https://pve.example.lan:8006/"
+proxmox_node          = "pve"
+template_vm_id        = 9000
+datastore_id          = "local-lvm"
+network_bridge        = "vmbr0"
+gateway               = "192.168.1.1"
+dns_servers           = ["192.168.1.1"]
+ssh_username          = "ubuntu"
+ssh_public_key_file   = "~/.ssh/id_ed25519.pub"
+ssh_private_key_file  = "~/.ssh/id_ed25519"
+
+controller_nodes = [
+  {
+    name         = "k8s-control-1"
+    vm_id        = 9100
+    ipv4_address = "192.168.1.210/24"
+    cores        = 2
+    memory_mb    = 4096
+    disk_gb      = 40
+  }
+]
+
+worker_nodes = [
+  {
+    name         = "k8s-worker-1"
+    vm_id        = 9101
+    ipv4_address = "192.168.1.211/24"
+    cores        = 2
+    memory_mb    = 4096
+    disk_gb      = 40
+  },
+  {
+    name         = "k8s-worker-2"
+    vm_id        = 9102
+    ipv4_address = "192.168.1.212/24"
+    cores        = 2
+    memory_mb    = 4096
+    disk_gb      = 40
+  }
+]
+
+# Supply the token outside this file:
+# export TF_VAR_proxmox_api_token='user@realm!tokenid=secret'
+# export TF_VAR_proxmox_tls_insecure=true # only for a self-signed TLS certificate
