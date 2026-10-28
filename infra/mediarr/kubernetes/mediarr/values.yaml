@@ -1,0 +1,10 @@
+namespace: mediarr
+mediaPVC: media-pvc
+timezone: Europe/Amsterdam
+apps:
+  radarr: {enabled: true, host: radarr.local}
+  sonarr: {enabled: true, host: sonarr.local}
+  lidarr: {enabled: true, host: lidarr.local}
+  whisparr: {enabled: true, host: whisparr.local}
+  prowlarr: {enabled: true, host: prowlarr.local}
+  lazylibrarian: {enabled: true, host: lazylibrarian.local}

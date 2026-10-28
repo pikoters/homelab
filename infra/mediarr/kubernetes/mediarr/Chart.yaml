@@ -1,0 +1,5 @@
+apiVersion: v2
+name: mediarr
+description: Media automation stack
+version: 1.0.0
+type: application

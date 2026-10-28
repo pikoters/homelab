@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: whisparr
+  namespace: mediarr
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: whisparr
+  template:
+    metadata:
+      labels:
+        app: whisparr
+    spec:
+      containers:
+      - name: whisparr
+        image: ghcr.io/hotio/whisparr:latest
+        ports:
+        - containerPort: 6969
+        env:
+        - name: TZ
+          value: Europe/Amsterdam
+        - name: PUID
+          value: "1000"
+        - name: PGID
+          value: "1000"
+        volumeMounts:
+        - name: config
+          mountPath: /config
+        - name: media
+          mountPath: /media
+      volumes:
+      - name: config
+        persistentVolumeClaim:
+          claimName: whisparr-config
+      - name: media
+        persistentVolumeClaim:
+          claimName: media-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: whisparr
+  namespace: mediarr
+spec:
+  selector:
+    app: whisparr
+  ports:
+  - port: 80
+    targetPort: 6969

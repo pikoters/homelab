@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prowlarr
+  namespace: mediarr
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prowlarr
+  template:
+    metadata:
+      labels:
+        app: prowlarr
+    spec:
+      containers:
+      - name: prowlarr
+        image: lscr.io/linuxserver/prowlarr:latest
+        ports:
+        - containerPort: 9696
+        env:
+        - name: TZ
+          value: Europe/Amsterdam
+        - name: PUID
+          value: "1000"
+        - name: PGID
+          value: "1000"
+        volumeMounts:
+        - name: config
+          mountPath: /config
+        - name: media
+          mountPath: /media
+      volumes:
+      - name: config
+        persistentVolumeClaim:
+          claimName: prowlarr-config
+      - name: media
+        persistentVolumeClaim:
+          claimName: media-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prowlarr
+  namespace: mediarr
+spec:
+  selector:
+    app: prowlarr
+  ports:
+  - port: 80
+    targetPort: 9696

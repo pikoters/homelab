@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: radarr
+  namespace: mediarr
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: radarr
+  template:
+    metadata:
+      labels:
+        app: radarr
+    spec:
+      initContainers:
+      - name: prepare-download-directory
+        image: busybox:1.37.0
+        command: ["mkdir", "-p", "/media/torrent/radarr"]
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+        volumeMounts:
+        - name: media
+          mountPath: /media
+      containers:
+      - name: radarr
+        image: lscr.io/linuxserver/radarr:latest
+        ports:
+        - containerPort: 7878
+        env:
+        - name: TZ
+          value: Europe/Amsterdam
+        - name: PUID
+          value: "1000"
+        - name: PGID
+          value: "1000"
+        volumeMounts:
+        - name: config
+          mountPath: /config
+        - name: media
+          mountPath: /media
+      volumes:
+      - name: config
+        persistentVolumeClaim:
+          claimName: radarr-config
+      - name: media
+        persistentVolumeClaim:
+          claimName: media-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: radarr
+  namespace: mediarr
+spec:
+  selector:
+    app: radarr
+  ports:
+  - port: 80
+    targetPort: 7878
